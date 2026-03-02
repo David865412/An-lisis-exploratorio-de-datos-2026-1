@@ -1,0 +1,100 @@
+# Generate final figures and tables for the report
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+sns.set(style='whitegrid')
+
+# Cargar datos limpios
+df = pd.read_csv('Saber_Pro_2020_1_Cali_cleaned.csv', encoding='utf-8')
+if 'area_simple' not in df.columns:
+    # En caso de que no exista, recrearla (aunque debería estar)
+    df['area_simple'] = df['COLE_AREA_UBICACION'].str.strip().str.capitalize()
+
+# Lista de materias (incluyendo global)
+subjects = ['PUNT_GLOBAL','PUNT_LECTURA_CRITICA','PUNT_MATEMATICAS',
+            'PUNT_C_NATURALES','PUNT_SOCIALES_CIUDADANAS','PUNT_INGLES']
+
+filenames = []
+
+# Generar boxplots para cada materia
+for s in subjects:
+    plt.figure(figsize=(8,4))
+    sns.boxplot(x='area_simple', y=s, data=df)
+    plt.title(f'{s} por área')
+    plt.tight_layout()
+    fname = f'{s}_by_area.png'
+    plt.savefig(fname)
+    plt.show()
+    filenames.append(fname)
+
+# Generar gráficos de densidad para cada materia
+for s in subjects:
+    plt.figure(figsize=(8,4))
+    for area in df['area_simple'].dropna().unique():
+        sns.kdeplot(df[df['area_simple']==area][s].dropna(), label=area, fill=True)
+    plt.title(f'Densidad de {s} por área')
+    plt.legend()
+    plt.tight_layout()
+    fname = f'{s}_density_by_area.png'
+    plt.savefig(fname)
+    plt.show()
+    filenames.append(fname)
+
+# Gráfico de barras con media ponderada por colegio e IC 95% (bootstrap)
+# Primero calculamos medias ponderadas por colegio
+school_means = df.groupby(['COLE_NOMBRE_ESTABLECIMIENTO','area_simple'])['PUNT_GLOBAL'].agg(['mean','count']).reset_index()
+school_means['weighted'] = school_means['mean'] * school_means['count']
+
+# Media ponderada global por área
+weighted_means = school_means.groupby('area_simple').apply(
+    lambda x: np.average(x['mean'], weights=x['count'])
+).reset_index(name='weighted_mean')
+
+# Bootstrap para IC de la media ponderada (re-muestreo de colegios)
+rng = np.random.default_rng(42)
+boot_means = {'Urbano': [], 'Rural': []}
+for area in ['Urbano','Rural']:
+    schools_area = school_means[school_means['area_simple']==area]
+    for _ in range(2000):
+        sample = schools_area.sample(n=len(schools_area), replace=True, random_state=rng)
+        wm = np.average(sample['mean'], weights=sample['count'])
+        boot_means[area].append(wm)
+
+ci = {}
+for area in ['Urbano','Rural']:
+    ci[area] = np.percentile(boot_means[area], [2.5, 97.5])
+
+# Gráfico
+plt.figure(figsize=(6,4))
+x_pos = np.arange(len(weighted_means['area_simple']))
+plt.bar(x_pos, weighted_means['weighted_mean'], yerr=[ (wm - ci[area][0], ci[area][1] - wm) for area, wm in zip(weighted_means['area_simple'], weighted_means['weighted_mean']) ], capsize=5)
+plt.xticks(x_pos, weighted_means['area_simple'])
+plt.ylabel('Media ponderada PUNT_GLOBAL')
+plt.title('Media ponderada de PUNT_GLOBAL por área con IC 95% (bootstrap)')
+plt.tight_layout()
+fname = 'PUNT_GLOBAL_mean_ci.png'
+plt.savefig(fname)
+plt.show()
+filenames.append(fname)
+
+print('Figuras guardadas:')
+for f in filenames:
+    print(f)
+
+# Generar listados de colegios top y bottom (mínimo 5 estudiantes)
+school_stats = df.groupby('COLE_NOMBRE_ESTABLECIMIENTO').agg(
+    n_students=('PUNT_GLOBAL','count'),
+    mean_global=('PUNT_GLOBAL','mean')
+).reset_index()
+school_stats = school_stats[school_stats['n_students'] >= 5]
+top = school_stats.sort_values('mean_global', ascending=False).head(10)
+bottom = school_stats.sort_values('mean_global', ascending=True).head(10)
+
+top.to_csv('top_schools.csv', index=False)
+bottom.to_csv('bottom_schools.csv', index=False)
+print('Archivos top_schools.csv y bottom_schools.csv guardados.')
+print('Top 5 colegios:')
+print(top.head())
