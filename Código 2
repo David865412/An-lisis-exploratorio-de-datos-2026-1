@@ -1,0 +1,98 @@
+# Stepwise advanced analysis for Cali rural vs urban — regression and bootstrap
+# Load cleaned data
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import statsmodels.formula.api as smf
+
+sns.set(style='whitegrid')
+
+df = pd.read_csv('Saber_Pro_2020_1_Cali_cleaned.csv', encoding='utf-8')
+print('Filas, columnas:', df.shape)
+
+# Asegurar variables binarias
+if 'tiene_internet' not in df.columns:
+    df['tiene_internet'] = df['FAMI_TIENEINTERNET'].str.contains('Si', case=False, na=False)
+
+# Eliminar filas con valores faltantes en variables clave
+df = df.dropna(subset=['PUNT_GLOBAL','area_simple'])
+
+# 1) Medias ponderadas por colegio (para evitar sesgo por tamaño)
+school_stats = df.groupby(['COLE_NOMBRE_ESTABLECIMIENTO','area_simple']).agg(
+    n_students=('PUNT_GLOBAL','count'),
+    mean_global=('PUNT_GLOBAL','mean')
+).reset_index()
+school_stats['weighted_mean'] = school_stats['mean_global'] * school_stats['n_students']
+area_weighted = school_stats.groupby('area_simple').agg(
+    total_students=('n_students','sum'),
+    sum_weighted=('weighted_mean','sum')
+).reset_index()
+area_weighted['weighted_mean_global'] = area_weighted['sum_weighted'] / area_weighted['total_students']
+print('Medias ponderadas por colegio:')
+print(area_weighted)
+
+# Guardar estadísticas por colegio
+school_stats.to_csv('school_stats_cali.csv', index=False)
+
+# 2) Regresión OLS con controles
+# Codificaciones numéricas
+df['estrato_num'] = pd.to_numeric(df['estrato'], errors='coerce')
+df['cole_naturaleza_public'] = df['COLE_NATURALEZA'].str.contains('OFICIAL', case=False, na=False)
+df['bilingue'] = df['COLE_BILINGUE'].str.contains('Si', case=False, na=False)
+
+# Modelo: variable dependiente PUNT_GLOBAL
+model = smf.ols('PUNT_GLOBAL ~ C(area_simple) + estrato_num + tiene_internet + cole_naturaleza_public + bilingue',
+                data=df).fit(cov_type='HC3')
+print(model.summary())
+
+# Guardar resultados del modelo
+model.save('ols_model_results.pickle')
+
+# 3) Pruebas no paramétricas y bootstrap para PUNT_GLOBAL
+urb = df[df['area_simple']=='Urbano']['PUNT_GLOBAL'].dropna()
+rur = df[df['area_simple']=='Rural']['PUNT_GLOBAL'].dropna()
+
+# Mann-Whitney U
+mw_p = stats.mannwhitneyu(urb, rur, alternative='two-sided').pvalue
+print('Mann-Whitney p-valor:', mw_p)
+
+# Bootstrap de la diferencia de medias (urb - rur)
+rng = np.random.default_rng(42)
+boots = []
+for i in range(2000):
+    u = rng.choice(urb, size=len(urb), replace=True)
+    r = rng.choice(rur, size=len(rur), replace=True)
+    boots.append(u.mean() - r.mean())
+ci_lower, ci_upper = np.percentile(boots, [2.5, 97.5])
+print(f'Bootstrap IC 95% para (urb - rur): [{ci_lower:.2f}, {ci_upper:.2f}]')
+
+# 4) Comparación por materia con t-test y d de Cohen
+subjects = ['PUNT_LECTURA_CRITICA','PUNT_MATEMATICAS','PUNT_C_NATURALES',
+            'PUNT_SOCIALES_CIUDADANAS','PUNT_INGLES']
+rows = []
+for s in subjects:
+    u = df[df['area_simple']=='Urbano'][s].dropna()
+    r = df[df['area_simple']=='Rural'][s].dropna()
+    if len(u)>1 and len(r)>1:
+        t, p = stats.ttest_ind(u, r, equal_var=False)
+        d = (u.mean() - r.mean()) / (((u.std()**2 + r.std()**2)/2)**0.5)
+        rows.append((s, len(u), len(r), u.mean(), r.mean(), t, p, d))
+
+subj_df = pd.DataFrame(rows, columns=['subject','n_urb','n_rur','mean_urb','mean_rur','tstat','pvalue','cohen_d'])
+print(subj_df)
+subj_df.to_csv('subject_tests_advanced.csv', index=False)
+
+# 5) Visualizaciones adicionales: coeficiente de área
+coef_plot = model.params[['C(area_simple)[T.Rural]']]
+errs = model.bse[['C(area_simple)[T.Rural]']]
+plt.figure(figsize=(6,3))
+plt.errorbar(x=[0], y=coef_plot, yerr=errs, fmt='o')
+plt.xticks([0], ['Rural vs Urbano'])
+plt.ylabel('Coeficiente sobre PUNT_GLOBAL')
+plt.axhline(0, color='k', linestyle='--')
+plt.title('Efecto de zona rural (controlado)')
+plt.tight_layout()
+plt.savefig('coef_area.png')
+plt.show()
